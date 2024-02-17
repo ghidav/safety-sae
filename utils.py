@@ -4,7 +4,7 @@ from neel.imports import *
 from neel.utils import *
 from neel_plotly import *
 import torch
-from transformers import HookedTransformer
+from transformer_lens import HookedTransformer
 import json
 import random
 import torch.nn.functional as F
@@ -43,9 +43,10 @@ def arg_parse_update_cfg(default_cfg):
     print("Updated config")
     print(json.dumps(cfg, indent=2))
     return cfg
+
 default_cfg = {
     "seed": 49,
-    "batch_size": 1024,
+    "batch_size": 512,
     "buffer_mult": 384,
     "lr": 1e-4,
     "num_tokens": int(2e9),
@@ -54,11 +55,11 @@ default_cfg = {
     "beta2": 0.99,
     "dict_mult": 4,
     "seq_len": 128,
-    "enc_dtype":"fp32",
+    "enc_dtype":"fp16",
     "remove_rare_dir": False,
-    "model_name": "gelu-2l",
+    "model_name": "llama-2-7b-chat",
     "site": "mlp_out",
-    "layer": 0,
+    "layer": 31,
     "device": "cuda:0"
 }
 site_to_size = {
@@ -81,35 +82,14 @@ def post_init_cfg(cfg):
 post_init_cfg(cfg)
 pprint.pprint(cfg)
 # %%
-
 SEED = cfg["seed"]
 GENERATOR = torch.manual_seed(SEED)
 DTYPES = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.float16}
 np.random.seed(SEED)
 random.seed(SEED)
 torch.set_grad_enabled(True)
-
-model = HookedTransformer.from_pretrained(cfg["model_name"]).to(DTYPES[cfg["enc_dtype"]]).to(cfg["device"])
-
-n_layers = model.cfg.n_layers
-d_model = model.cfg.d_model
-n_heads = model.cfg.n_heads
-d_head = model.cfg.d_head
-d_mlp = model.cfg.d_mlp
-d_vocab = model.cfg.d_vocab
 # %%
-@torch.no_grad()
-def get_acts(tokens, batch_size=1024):
-    _, cache = model.run_with_cache(tokens, stop_at_layer=cfg["layer"]+1, names_filter=cfg["act_name"])
-    acts = cache[cfg["act_name"]]
-    acts = acts.reshape(-1, acts.shape[-1])
-    subsample = torch.randperm(acts.shape[0], generator=GENERATOR)[:batch_size]
-    subsampled_acts = acts[subsample, :]
-    return subsampled_acts, acts
-# sub, acts = get_acts(torch.arange(20).reshape(2, 10), batch_size=3)
-# sub.shape, acts.shape
-# %%
-SAVE_DIR = Path("/workspace/1L-Sparse-Autoencoder/checkpoints")
+SAVE_DIR = Path("models/checkpoints")
 class AutoEncoder(nn.Module):
     def __init__(self, cfg):
         super().__init__()
@@ -197,20 +177,15 @@ class AutoEncoder(nn.Module):
         self = cls(cfg=cfg)
         self.load_state_dict(utils.download_file_from_hf("NeelNanda/sparse_autoencoder", f"{version}.pt", force_is_torch=True))
         return self
-
-# %%
-
-
-
 # %%
 def shuffle_data(all_tokens):
     print("Shuffled data")
     return all_tokens[torch.randperm(all_tokens.shape[0])]
 
-loading_data_first_time = False
-if loading_data_first_time:
-    data = load_dataset("NeelNanda/c4-code-tokenized-2b", split="train", cache_dir="/workspace/cache/")
-    data.save_to_disk("/workspace/data/c4_code_tokenized_2b.hf")
+
+def prepare_data(model):
+    data = load_dataset("DavideG/safety-data", split="train", cache_dir="cache/")
+    data.save_to_disk("data/safety_data.hf")
     data.set_format(type="torch", columns=["tokens"])
     all_tokens = data["tokens"]
     all_tokens.shape
@@ -219,22 +194,27 @@ if loading_data_first_time:
     all_tokens_reshaped = einops.rearrange(all_tokens, "batch (x seq_len) -> (batch x) seq_len", x=8, seq_len=128)
     all_tokens_reshaped[:, 0] = model.tokenizer.bos_token_id
     all_tokens_reshaped = all_tokens_reshaped[torch.randperm(all_tokens_reshaped.shape[0])]
-    torch.save(all_tokens_reshaped, "/workspace/data/c4_code_2b_tokens_reshaped.pt")
-else:
-    # data = datasets.load_from_disk("/workspace/data/c4_code_tokenized_2b.hf")
-    all_tokens = torch.load("/workspace/data/c4_code_2b_tokens_reshaped.pt")
-    all_tokens = shuffle_data(all_tokens)
+    torch.save(all_tokens_reshaped, "data/safety_data.pt")
+    return all_tokens
 
+loading_data_first_time=False
+
+if loading_data_first_time:
+    all_tokens = prepare_data(model)
+
+all_tokens = torch.load("data/safety_data.pt")
+all_tokens = shuffle_data(all_tokens)
 # %%
 class Buffer():
     """
     This defines a data buffer, to store a bunch of MLP acts that can be used to train the autoencoder. It'll automatically run the model to generate more when it gets halfway empty. 
     """
-    def __init__(self, cfg):
+    def __init__(self, model, cfg):
         self.buffer = torch.zeros((cfg["buffer_size"], cfg["act_size"]), dtype=torch.float16, requires_grad=False).to(cfg["device"])
         self.cfg = cfg
         self.token_pointer = 0
         self.first = True
+        self.model = model
         self.refresh()
     
     @torch.no_grad()
@@ -248,7 +228,7 @@ class Buffer():
             self.first = False
             for _ in range(0, num_batches, self.cfg["model_batch_size"]):
                 tokens = all_tokens[self.token_pointer:self.token_pointer+self.cfg["model_batch_size"]]
-                _, cache = model.run_with_cache(tokens, stop_at_layer=cfg["layer"]+1, names_filter=cfg["act_name"])
+                _, cache = self.model.run_with_cache(tokens, stop_at_layer=cfg["layer"]+1, names_filter=cfg["act_name"])
                 acts = cache[cfg["act_name"]].reshape(-1, self.cfg["act_size"])
                 
                 # print(tokens.shape, acts.shape, self.pointer, self.token_pointer)
@@ -287,9 +267,7 @@ def zero_ablate_hook(mlp_post, hook):
     return mlp_post
 
 @torch.no_grad()
-def get_recons_loss(num_batches=5, local_encoder=None):
-    if local_encoder is None:
-        local_encoder = encoder
+def get_recons_loss(model, local_encoder, num_batches=5):
     loss_list = []
     for i in range(num_batches):
         tokens = all_tokens[torch.randperm(len(all_tokens))[:cfg["model_batch_size"]]]
@@ -311,9 +289,7 @@ def get_recons_loss(num_batches=5, local_encoder=None):
 # %%
 # Frequency
 @torch.no_grad()
-def get_freqs(num_batches=25, local_encoder=None):
-    if local_encoder is None:
-        local_encoder = encoder
+def get_freqs(model,local_encoder, num_batches=25):
     act_freq_scores = torch.zeros(local_encoder.d_hidden, dtype=torch.float32).to(cfg["device"])
     total = 0
     for i in tqdm.trange(num_batches):

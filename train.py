@@ -56,6 +56,6 @@ try:
             freqs = get_freqs(50, local_encoder=encoder.module)
             to_be_reset = (freqs<10**(-5.5))
             print("Resetting neurons!", to_be_reset.sum())
-            re_init(to_be_reset, encoder)
+            re_init(to_be_reset, encoder.module)
 finally:
     encoder.module.save()
