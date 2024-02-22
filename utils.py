@@ -49,25 +49,28 @@ default_cfg = {
     "batch_size": 512,
     "buffer_mult": 384,
     "lr": 1e-4,
-    "num_tokens": int(2e9),
+    "num_tokens": int(2e7),
     "l1_coeff": 0.008,
     "beta1": 0.9,
     "beta2": 0.99,
     "dict_mult": 4,
-    "seq_len": 128,
-    "enc_dtype":"fp16",
+    "seq_len": 512,
+    "enc_dtype":"fp32",
     "remove_rare_dir": False,
-    "model_name": "llama-2-7b-chat",
-    "site": "mlp_out",
-    "layer": 31,
-    "device": "cuda:0"
+    "model_name": "gpt2",
+    "hf_model": "ghidav/gpt2-full-20g2s",
+    "site": "post",
+    "layer": 11,
+    "device": "cuda:0",
+    "n_buffers": 2,
+    "buffer_device": ["cuda:1", "cuda:2"] #, "cuda:3"]
 }
 site_to_size = {
-    "mlp_out": 4096,
-    "post": 11008,
-    "resid_pre": 4096,
-    "resid_mid": 4096,
-    "resid_post": 4096,
+    "mlp_out": 768,
+    "post": 3072,
+    "resid_pre": 768,
+    "resid_mid": 768,
+    "resid_post": 768,
 }
 
 cfg = arg_parse_update_cfg(default_cfg)
@@ -120,7 +123,7 @@ class AutoEncoder(nn.Module):
     
     @torch.no_grad()
     def make_decoder_weights_and_grad_unit_norm(self):
-        W_dec_normed = self.W_dec / self.W_dec.norm(dim=-1, keepdim=True)
+        W_dec_normed = self.W_dec / self.W_dec.norm(dim=-1, keepdim=True).clamp(min=torch.finfo(self.W_dec.dtype).eps)
         W_dec_grad_proj = (self.W_dec.grad * W_dec_normed).sum(-1, keepdim=True) * W_dec_normed
         self.W_dec.grad -= W_dec_grad_proj
         # Bugfix(?) for ensuring W_dec retains unit norm, this was not there when I trained my original autoencoders.
@@ -158,97 +161,99 @@ class AutoEncoder(nn.Module):
 
 
     @classmethod
-    def load_from_hf(cls, version):
-        """
-        Loads the saved autoencoder from HuggingFace. 
-        
-        Version is expected to be an int, or "run1" or "run2"
-
-        version 25 is the final checkpoint of the first autoencoder run,
-        version 47 is the final checkpoint of the second autoencoder run.
-        """
-        if version=="run1":
-            version = 25
-        elif version=="run2":
-            version = 47
-        
-        cfg = utils.download_file_from_hf("NeelNanda/sparse_autoencoder", f"{version}_cfg.json")
+    def load_from_hf(cls, model_name):        
+        cfg = utils.download_file_from_hf(model_name, f"config.json")
         pprint.pprint(cfg)
         self = cls(cfg=cfg)
-        self.load_state_dict(utils.download_file_from_hf("NeelNanda/sparse_autoencoder", f"{version}.pt", force_is_torch=True))
+        self.load_state_dict(utils.download_file_from_hf(model_name, f"model.pt", force_is_torch=True))
         return self
 # %%
 def shuffle_data(all_tokens):
     print("Shuffled data")
     return all_tokens[torch.randperm(all_tokens.shape[0])]
 
+def prepare_data(dataset_name):
+    repo, name = dataset_name.split("/")
+    data = load_dataset(dataset_name, split="train", cache_dir="cache/").shuffle()
+    #data.save_to_disk("data/safety_data.hf")
 
-def prepare_data(model):
-    data = load_dataset("DavideG/safety-data", split="train", cache_dir="cache/")
-    data.save_to_disk("data/safety_data.hf")
     data.set_format(type="torch", columns=["tokens"])
-    all_tokens = data["tokens"]
-    all_tokens.shape
+    tokens = [i['input_ids'] for i in data["tokens"]]
+    attn_mask = [i['attention_mask'] for i in data["tokens"]]
 
+    def reshape_(x):
+        x_resh = einops.rearrange(x, "batch (x seq_len) -> (batch x) seq_len", x=1, seq_len=512)
+        return x_resh[torch.randperm(x_resh.shape[0])]
+    
+    tokens_reshaped = reshape_(tokens)
+    attn_mask_reshaped = reshape_(attn_mask)
 
-    all_tokens_reshaped = einops.rearrange(all_tokens, "batch (x seq_len) -> (batch x) seq_len", x=8, seq_len=128)
-    all_tokens_reshaped[:, 0] = model.tokenizer.bos_token_id
-    all_tokens_reshaped = all_tokens_reshaped[torch.randperm(all_tokens_reshaped.shape[0])]
-    torch.save(all_tokens_reshaped, "data/safety_data.pt")
-    return all_tokens
+    torch.save(tokens_reshaped, f"data/{name}_tokens.pt")
+    torch.save(attn_mask_reshaped, f"data/{name}_attn_mask.pt")
+
+    return tokens_reshaped, attn_mask_reshaped
 
 loading_data_first_time=False
+dataset_name = "ghidav/safety-data-gpt2"
 
 if loading_data_first_time:
-    all_tokens = prepare_data(model)
-
-all_tokens = torch.load("data/safety_data.pt")
-all_tokens = shuffle_data(all_tokens)
+    tokens = prepare_data(dataset_name)
 # %%
 class Buffer():
     """
     This defines a data buffer, to store a bunch of MLP acts that can be used to train the autoencoder. It'll automatically run the model to generate more when it gets halfway empty. 
     """
-    def __init__(self, model, cfg):
-        self.buffer = torch.zeros((cfg["buffer_size"], cfg["act_size"]), dtype=torch.float16, requires_grad=False).to(cfg["device"])
+    def __init__(self, model, tokens, mask, device, cfg):
         self.cfg = cfg
         self.token_pointer = 0
         self.first = True
         self.model = model
+        self.tokens = tokens
+        self.mask = mask
+        self.device = device
+        self.dtype = DTYPES[cfg["enc_dtype"]]
+        self.buffer = torch.zeros((cfg["buffer_size"], cfg["act_size"]), dtype=self.dtype, requires_grad=False, device=self.device)
+        self.token_buffer = torch.ones((cfg["buffer_size"]), dtype=torch.long, requires_grad=False, device=self.device) * -1
         self.refresh()
     
     @torch.no_grad()
     def refresh(self):
         self.pointer = 0
-        with torch.autocast("cuda", torch.float16):
+        with torch.autocast("cuda", self.dtype):
             if self.first:
                 num_batches = self.cfg["buffer_batches"]
             else:
                 num_batches = self.cfg["buffer_batches"]//2
             self.first = False
             for _ in range(0, num_batches, self.cfg["model_batch_size"]):
-                tokens = all_tokens[self.token_pointer:self.token_pointer+self.cfg["model_batch_size"]]
-                _, cache = self.model.run_with_cache(tokens, stop_at_layer=cfg["layer"]+1, names_filter=cfg["act_name"])
-                acts = cache[cfg["act_name"]].reshape(-1, self.cfg["act_size"])
+                tokens = self.tokens[self.token_pointer:self.token_pointer+self.cfg["model_batch_size"]] # [bs, seq_len]
+                mask = self.mask[self.token_pointer:self.token_pointer+self.cfg["model_batch_size"]] # [bs, seq_len]
+                _, cache = self.model.run_with_cache(tokens, attention_mask=mask, stop_at_layer=cfg["layer"]+1, names_filter=cfg["act_name"])
                 
-                # print(tokens.shape, acts.shape, self.pointer, self.token_pointer)
+                acts = cache[cfg["act_name"]] # [bs, seq_len, d_model]
+                acts = torch.masked_select(acts, mask[..., None].type(torch.bool).to(acts.device)).reshape(-1, self.cfg["act_size"]) # [bs * seq_len, d_model]
+            
                 self.buffer[self.pointer: self.pointer+acts.shape[0]] = acts
+                self.token_buffer[self.pointer: self.pointer+acts.shape[0]] = torch.masked_select(tokens, mask.type(torch.bool).to(tokens.device)).reshape(-1)
                 self.pointer += acts.shape[0]
                 self.token_pointer += self.cfg["model_batch_size"]
-                # if self.token_pointer > all_tokens.shape[0] - self.cfg["model_batch_size"]:
-                #     self.token_pointer = 0
 
-        self.pointer = 0
-        self.buffer = self.buffer[torch.randperm(self.buffer.shape[0]).to(cfg["device"])]
+        #self.pointer = 0
+        #self.buffer = self.buffer[torch.randperm(self.buffer.shape[0]).to(self.device)]
 
     @torch.no_grad()
-    def next(self):
-        out = self.buffer[self.pointer:self.pointer+self.cfg["batch_size"]]
-        self.pointer += self.cfg["batch_size"]
-        if self.pointer > self.buffer.shape[0]//2 - self.cfg["batch_size"]:
-            # print("Refreshing the buffer!")
+    def next(self, return_tokens=False):
+        out = self.buffer[self.pointer-self.cfg["batch_size"]:self.pointer]
+        out_tokens = self.token_buffer[self.pointer-self.cfg["batch_size"]:self.pointer]
+        self.pointer -= self.cfg["batch_size"]
+        if self.pointer < self.cfg["batch_size"] * 5:
+            #print("Refreshing the buffer!")
             self.refresh()
-        return out
+        
+        if return_tokens:
+            return out, out_tokens
+        else:
+            return out
 
 # buffer.refresh()
  # %%
@@ -267,12 +272,16 @@ def zero_ablate_hook(mlp_post, hook):
     return mlp_post
 
 @torch.no_grad()
-def get_recons_loss(model, local_encoder, num_batches=5):
+def get_recons_loss(model, encoder, all_tokens, num_batches=5, verbose=True):
     loss_list = []
-    for i in range(num_batches):
+    if verbose:
+        rg = tqdm.trange(num_batches)
+    else:
+        rg = range(num_batches)
+    for i in rg:
         tokens = all_tokens[torch.randperm(len(all_tokens))[:cfg["model_batch_size"]]]
         loss = model(tokens, return_type="loss")
-        recons_loss = model.run_with_hooks(tokens, return_type="loss", fwd_hooks=[(cfg["act_name"], partial(replacement_hook, encoder=local_encoder))])
+        recons_loss = model.run_with_hooks(tokens, return_type="loss", fwd_hooks=[(cfg["act_name"], partial(replacement_hook, encoder=encoder))])
         # mean_abl_loss = model.run_with_hooks(tokens, return_type="loss", fwd_hooks=[(cfg["act_name"], mean_ablate_hook)])
         zero_abl_loss = model.run_with_hooks(tokens, return_type="loss", fwd_hooks=[(cfg["act_name"], zero_ablate_hook)])
         loss_list.append((loss, recons_loss, zero_abl_loss))
@@ -289,17 +298,17 @@ def get_recons_loss(model, local_encoder, num_batches=5):
 # %%
 # Frequency
 @torch.no_grad()
-def get_freqs(model,local_encoder, num_batches=25):
-    act_freq_scores = torch.zeros(local_encoder.d_hidden, dtype=torch.float32).to(cfg["device"])
+def get_freqs(buffer, encoder, num_batches=25):
+    if isinstance(encoder, nn.DataParallel):
+        act_freq_scores = torch.zeros(encoder.module.d_hidden, dtype=torch.float32).to(cfg["device"])
+    else:
+        act_freq_scores = torch.zeros(encoder.d_hidden, dtype=torch.float32).to(cfg["device"])
+
     total = 0
     for i in tqdm.trange(num_batches):
-        tokens = all_tokens[torch.randperm(len(all_tokens))[:cfg["model_batch_size"]]]
-        
-        _, cache = model.run_with_cache(tokens, stop_at_layer=cfg["layer"]+1, names_filter=cfg["act_name"])
-        acts = cache[cfg["act_name"]]
-        acts = acts.reshape(-1, cfg["act_size"])
+        acts = buffer.next()
 
-        hidden = local_encoder(acts)[2]
+        hidden = encoder(acts)[2]
         
         act_freq_scores += (hidden > 0).sum(0)
         total+=hidden.shape[0]

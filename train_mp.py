@@ -1,33 +1,65 @@
 from utils import *
 import wandb
-import tqdm
+from tqdm import tqdm
 import torch
 import torch.nn as nn
 import torch.multiprocessing as mp
 from transformer_lens import HookedTransformer
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # Make sure to call this at the beginning of your script
 mp.set_start_method('spawn', force=True)
+torch.autograd.set_detect_anomaly(True)
 
 def batch_producer(buffer, queue, num_batches):
     for _ in range(num_batches):
         batch = buffer.next()
-        queue.put(batch)
+        queue.put(batch.cpu())
     queue.put(None)  # Signal the end of batches
 
+def load_model(cfg):
+    if cfg["hf_model"] is not None:
+        hf_model = AutoModelForCausalLM.from_pretrained(cfg["hf_model"])
+        model = HookedTransformer.from_pretrained_no_processing(cfg["model_name"], hf_model=hf_model, dtype=DTYPES[cfg["enc_dtype"]])
+    else:
+        model = HookedTransformer.from_pretrained_no_processing(cfg["model_name"], dtype=DTYPES[cfg["enc_dtype"]])
+    return model
+
 def main(cfg):
+    # Load data
+    dataset_name = "safety-data-gpt2"
+    all_tokens = torch.load(f"data/{dataset_name}_tokens.pt")
+    all_masks = torch.load(f"data/{dataset_name}_attn_mask.pt")
+
+    N = len(all_tokens) // cfg['n_buffers']
+    tokens = [all_tokens[i*N:(i+1)*N] for i in range(cfg['n_buffers'])]
+    masks = [all_masks[i*N:(i+1)*N] for i in range(cfg['n_buffers'])]
+
+    print(all_tokens[0, :10], all_tokens.shape, all_masks[0, :10], all_masks.shape)
+
+    # Load models
     encoder = AutoEncoder(cfg)
+
     encoder = nn.DataParallel(encoder)
     encoder.to(cfg["device"])
-    model = HookedTransformer.from_pretrained(cfg["model_name"], n_devices=4, dtype=DTYPES[cfg["enc_dtype"]])
-    buffer = Buffer(model, cfg)
+    models = []
+    for i in range(cfg['n_buffers']):
+        models.append(load_model(cfg))
+
+    buffers = []
+    for i in range(cfg['n_buffers']):
+        device = cfg["buffer_device"][i]
+        buffer = Buffer(models[i].to(device), tokens[i], masks[i], device, cfg)
+        buffers.append(buffer)
     
-    queue = mp.Queue(maxsize=10)  # Adjust maxsize as needed
-    total_batches = cfg["num_tokens"] // cfg["batch_size"]
+    queue = mp.Queue(maxsize=cfg["batch_size"])  # Adjust maxsize as needed
+    total_batches = all_masks.sum().item() // cfg["batch_size"]
     
     # Start batch producer process
-    producer_process = mp.Process(target=batch_producer, args=(buffer, queue, cfg["num_tokens"] // cfg["batch_size"]))
-    producer_process.start()
+    processes = []
+    for buffer in buffers:
+        processes.append(mp.Process(target=batch_producer, args=(buffer, queue, total_batches // cfg["n_buffers"])))
+        processes[-1].start()
     
     try:
         wandb.init(project="autoencoder", entity="davide-ghilardi0")
@@ -37,8 +69,11 @@ def main(cfg):
             while True:
                 batch = queue.get()
                 if batch is None:  # Check for the end signal
+                    for p in processes:
+                        p.terminate()
+                        p.join()
                     break
-                acts = batch
+                acts = batch.to('cuda:0')
                 loss, x_reconstruct, mid_acts, l2_loss, l1_loss = encoder(acts)
                 loss.mean().backward()
                 encoder.module.make_decoder_weights_and_grad_unit_norm()
@@ -48,16 +83,19 @@ def main(cfg):
                 
                 if (pbar.n) % 100 == 0:
                     wandb.log(loss_dict)
-                if (pbar.n + 1) % 20000 == 0:
+                if (pbar.n + 1) % 10000 == 0:
                     wandb.log({"reset_neurons": 0.0})
-                    freqs = get_freqs(50, local_encoder=encoder.module)
+                    freqs = get_freqs(buffers[0], encoder, 50)
                     to_be_reset = (freqs < 10**(-5.5))
                     print("Resetting neurons!", to_be_reset.sum())
                     re_init(to_be_reset, encoder.module)
                 
                 pbar.update(1)  # Update the progress bar
+                if (pbar.n) % 200000 == 0:
+                    encoder.module.save()
+                del batch
+
     finally:
-        producer_process.join()
         encoder.module.save()
 
 if __name__ == "__main__":

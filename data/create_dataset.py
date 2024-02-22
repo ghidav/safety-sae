@@ -14,16 +14,33 @@ from datasets import load_dataset, concatenate_datasets, DatasetDict
 anthropic = load_dataset("anthropic/hh-rlhf")
 pku = load_dataset("pku-alignment/pku-saferlhf")
 
+template = "A chat between a user and an AI assistant. The assistant answers the user's questions.\n\n### User: {user}\n### Assistant: {asst}"
+
 # %%
 def anthropic_process(x):
     idx = bool(np.random.randint(0, 2))
     if idx:
-        return {'text': x['rejected']}
+        y = x['rejected']
     else:
-        return {'text': x['chosen']}
+        y = x['chosen']
+
+    # Split the text into segments based on 'Assistant:' and 'Human:'
+    segments = y.split('Assistant: ')
+    user = segments[0].split('Human: ')[1]  # Get the first 'Human:' segment
+
+    # Check if there's an 'Assistant:' segment
+    if len(segments) > 1:
+        assistant = segments[1].split('Human: ')[0]  # Get the first 'Assistant:' segment
+    else:
+        assistant = ''
+
+    return {'text': template.format(user=user, asst=assistant)}
 
 def pku_process(x):
-    return {'text': 'Human: ' + x['prompt'] + '\nAssistant: ' + x['response_0']}
+    def apply_template(x):
+         return template.format(user=x['prompt'], asst=x['response_0'])
+
+    return {'text': apply_template(x)}
 
 anthropic_proc = anthropic.map(anthropic_process)
 pku_proc = pku.map(pku_process)
@@ -36,14 +53,16 @@ test_dataset = concatenate_datasets([anthropic_proc['test'], pku_proc['test']])
 dataset = DatasetDict({'train': train_dataset, 'test': test_dataset})
 
 # Load a tokenizer
-tokenizer = AutoTokenizer.from_pretrained('meta-llama/Llama-2-7b-hf')
-tokenizer.pad_token = tokenizer.eos_token
-tokenizer.pad_token_id = tokenizer.eos_token_id
-tokenizer.padding_side = 'left' 
+tokenizer = AutoTokenizer.from_pretrained('gpt2')
+if not getattr(tokenizer, "pad_token", None):
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+
+tokenizer.padding_side = 'left'
 
 # Function to tokenize the 'text' column
 def tokenize_text(x):
-    return tokenizer(x['text'], truncation=True, padding='max_length', max_length=512)
+    return {'tokens': tokenizer(x['text'], truncation=True, padding='max_length', max_length=512)}
 
 # Map the function to the dataset
 dataset = dataset.map(tokenize_text)
@@ -53,5 +72,5 @@ dataset = dataset.remove_columns(['chosen', 'rejected', 'prompt', 'response_0', 
 
 # %%
 dataset.set_format(type='torch')
-dataset.push_to_hub("safety-data")
+dataset.push_to_hub("safety-data-gpt2")
 # %%
