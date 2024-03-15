@@ -58,7 +58,7 @@ if not getattr(tokenizer, "pad_token", None):
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
-tokenizer.padding_side = 'left'
+tokenizer.padding_side = 'right'
 
 # Function to tokenize the 'text' column
 def tokenize_text(x):
@@ -69,7 +69,7 @@ dataset = dataset.map(tokenize_text)
 
 # Map the function to the dataset
 dataset = dataset.remove_columns(['chosen', 'rejected', 'prompt', 'response_0', 'response_1', 'is_response_0_safe', 'is_response_1_safe', 'better_response_id', 'safer_response_id'])
-
+#%%
 # %%
 dataset.set_format(type='torch')
 dataset.push_to_hub("safety-data-gpt2")

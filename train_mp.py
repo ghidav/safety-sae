@@ -6,8 +6,9 @@ import torch.nn as nn
 import torch.multiprocessing as mp
 from transformer_lens import HookedTransformer
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from datasets import load_dataset
+from torch.utils.data import DataLoader
 
-# Make sure to call this at the beginning of your script
 mp.set_start_method('spawn', force=True)
 torch.autograd.set_detect_anomaly(True)
 
@@ -15,7 +16,7 @@ def batch_producer(buffer, queue, num_batches):
     for _ in range(num_batches):
         batch = buffer.next()
         queue.put(batch.cpu())
-    queue.put(None)  # Signal the end of batches
+    queue.put(None)
 
 def load_model(cfg):
     if cfg["hf_model"] is not None:
@@ -24,18 +25,21 @@ def load_model(cfg):
     else:
         model = HookedTransformer.from_pretrained_no_processing(cfg["model_name"], dtype=DTYPES[cfg["enc_dtype"]])
     return model
-
+#%%
 def main(cfg):
     # Load data
-    dataset_name = "safety-data-gpt2"
-    all_tokens = torch.load(f"data/{dataset_name}_tokens.pt")
-    all_masks = torch.load(f"data/{dataset_name}_attn_mask.pt")
+    dataset_name = "alancooney/sae-monology-pile-uncopyrighted-tokenizer-gpt2"
+    #all_tokens = torch.load(f"data/{dataset_name}_tokens.pt")
+    #all_masks = torch.load(f"data/{dataset_name}_attn_mask.pt")
 
-    N = len(all_tokens) // cfg['n_buffers']
-    tokens = [all_tokens[i*N:(i+1)*N] for i in range(cfg['n_buffers'])]
-    masks = [all_masks[i*N:(i+1)*N] for i in range(cfg['n_buffers'])]
+    dataset = load_dataset(dataset_name, split="train")
+    dataloader = DataLoader(dataset, batch_size=cfg["batch_size"])
 
-    print(all_tokens[0, :10], all_tokens.shape, all_masks[0, :10], all_masks.shape)
+    #N = len(all_tokens) // cfg['n_buffers']
+    #tokens = [all_tokens[i*N:(i+1)*N] for i in range(cfg['n_buffers'])]
+    #masks = [all_masks[i*N:(i+1)*N] for i in range(cfg['n_buffers'])]
+
+    #print(all_tokens[0, :10], all_tokens.shape, all_masks[0, :10], all_masks.shape)
 
     # Load models
     encoder = AutoEncoder(cfg)
@@ -49,11 +53,11 @@ def main(cfg):
     buffers = []
     for i in range(cfg['n_buffers']):
         device = cfg["buffer_device"][i]
-        buffer = Buffer(models[i].to(device), tokens[i], masks[i], device, cfg)
+        buffer = Buffer(models[i].to(device), dataloader, device, cfg)
         buffers.append(buffer)
     
     queue = mp.Queue(maxsize=cfg["batch_size"])  # Adjust maxsize as needed
-    total_batches = all_masks.sum().item() // cfg["batch_size"]
+    total_batches = len(dataset) #all_masks.sum().item() // cfg["batch_size"]
     
     # Start batch producer process
     processes = []
@@ -91,7 +95,7 @@ def main(cfg):
                     re_init(to_be_reset, encoder.module)
                 
                 pbar.update(1)  # Update the progress bar
-                if (pbar.n) % 200000 == 0:
+                if (pbar.n) % 5000000 == 0:
                     encoder.module.save()
                 del batch
 
@@ -100,3 +104,5 @@ def main(cfg):
 
 if __name__ == "__main__":
     main(cfg)
+
+# %%
